@@ -40,14 +40,51 @@ async function saveScore() {
 }
 
 const tr = reactive({})
-const getMark = e => tr[e.athlete_id] ?? e.mark
-const setMark = (e, ev) => { tr[e.athlete_id] = Number(ev.target.value) }
+const getMark = e => tr[e.athlete_id] ?? (e.mark ?? '')
+// 保留原始字符串输入，避免空值被 Number('') 转成 0 混入结算
+const setMark = (e, ev) => { tr[e.athlete_id] = ev.target.value }
+// 空成绩排到最后，防止未录入行靠 NaN/0 排到榜首
+const sortEntries = list => [...list].sort((a, b) => {
+  const ma = Number(tr[a.athlete_id] ?? a.mark), mb = Number(tr[b.athlete_id] ?? b.mark)
+  const ea = Number.isFinite(ma) && ma > 0, eb = Number.isFinite(mb) && mb > 0
+  if (ea !== eb) return ea ? -1 : 1
+  if (!ea && !eb) return 0
+  return ma - mb
+})
 async function saveTrack(sid) {
   const list = store.entries.filter(e => e.sport_id === sid)
-  const sorted = list.map(e => ({ athlete_id: e.athlete_id, mark: Number(tr[e.athlete_id] ?? e.mark) })).sort((a, b) => a.mark - b.mark)
-  await store.saveTrack(sid, sorted)
-  toast.value = '✅ 田径成绩已按时间排序并结算金/银/铜'
-  setTimeout(() => toast.value = '', 2600)
+  if (!list.length) {
+    toast.value = '⚠️ 本项目暂无可结算的运动员成绩'
+    setTimeout(() => toast.value = '', 2600)
+    return
+  }
+  const payload = []
+  const ids = new Set()
+  for (const e of list) {
+    const raw = tr[e.athlete_id] ?? e.mark
+    const v = raw === '' || raw == null ? NaN : Number(raw)
+    if (!Number.isFinite(v) || v <= 0) {
+      toast.value = `⚠️ 运动员「${e.aname}」成绩为空或无效，请填写大于 0 的秒数`
+      setTimeout(() => toast.value = '', 3000)
+      return
+    }
+    if (ids.has(e.athlete_id)) {
+      toast.value = `⚠️ 运动员「${e.aname}」重复出现，结算已中止`
+      setTimeout(() => toast.value = '', 3000)
+      return
+    }
+    ids.add(e.athlete_id)
+    payload.push({ athlete_id: e.athlete_id, mark: v })
+  }
+  payload.sort((a, b) => a.mark - b.mark)
+  try {
+    await store.saveTrack(sid, payload)
+    Object.keys(tr).forEach(k => delete tr[k])
+    toast.value = '✅ 田径成绩已校验并按时间排序结算金/银/铜'
+  } catch (e) {
+    toast.value = '⚠️ ' + e.message
+  }
+  setTimeout(() => toast.value = '', 3000)
 }
 const rankCls = r => r === 1 ? '#d99a00' : r === 2 ? '#90a4ae' : r === 3 ? '#c9743a' : 'var(--muted)'
 </script>
@@ -117,11 +154,11 @@ const rankCls = r => r === 1 ? '#d99a00' : r === 2 ? '#90a4ae' : r === 3 ? '#c97
         <table>
           <thead><tr><th>#</th><th>运动员</th><th>单位</th><th>成绩(秒)</th></tr></thead>
           <tbody>
-            <tr v-for="(e, i) in store.entries.filter(x=>x.sport_id===s.id).sort((a,b)=>a.mark-b.mark)" :key="e.id">
-              <td><b :style="{ color: rankCls(e.rank), fontSize:'16px' }">{{ e.rank }}</b></td>
+            <tr v-for="(e, i) in sortEntries(store.entries.filter(x=>x.sport_id===s.id))" :key="e.id">
+              <td><b :style="{ color: rankCls(e.rank), fontSize:'16px' }">{{ e.rank ?? '—' }}</b></td>
               <td>{{ e.aname }}</td>
               <td><span class="badge"><span class="dot" :style="{ background: store.unitOfUid(e.unit_id)?.color }"></span>{{ e.unit }}</span></td>
-              <td><input :value="getMark(e)" @input="setMark(e, $event)" type="number" step="0.01" style="width:90px" /> <span class="tag gray mt8" style="margin-left:6px">s</span></td>
+              <td><input :value="getMark(e)" @input="setMark(e, $event)" type="number" step="0.01" min="0.01" placeholder="待录" style="width:90px" /> <span class="tag gray mt8" style="margin-left:6px">s</span></td>
             </tr>
           </tbody>
         </table>
