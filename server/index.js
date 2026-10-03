@@ -545,7 +545,8 @@ function recomputeMedals() {
   const sports = all('SELECT * FROM sports')
   sports.forEach(spo => {
     if (spo.format === 'track') {
-      const tops = all('SELECT * FROM entries WHERE sport_id=? ORDER BY mark ASC LIMIT 3', spo.id)
+      // 仅已录入有效成绩的参与奖牌结算（空成绩不参与排名）
+      const tops = all('SELECT * FROM entries WHERE sport_id=? AND mark IS NOT NULL ORDER BY mark ASC LIMIT 3', spo.id)
       add(tops[0]?.unit_id, 'gold'); add(tops[1]?.unit_id, 'silver'); add(tops[2]?.unit_id, 'bronze')
     } else if (spo.format === 'roundrobin') {
       const champ = get('SELECT s.*, t.unit_id FROM standings s JOIN teams t ON t.id=s.team_id WHERE s.sport_id=? AND s.rank=1', spo.id)
@@ -904,11 +905,59 @@ function generateKO(sportId) {
   return null
 }
 function finishTrack(sportId, body) {
-  // body: [{athlete_id, mark}] 按顺序
-  body.forEach((b, i) => run('UPDATE entries SET mark=?, rank=? WHERE athlete_id=? AND sport_id=?', b.mark, i + 1, b.athlete_id, sportId))
-  run('UPDATE sports SET finished=1 WHERE id=?', sportId)
+  // body: [{athlete_id, mark}]；服务端统一校验并按成绩升序排名，异常数据整体拒绝，不参与结算
+  if (!Number.isInteger(sportId)) throw new Error('项目编号无效')
+  const spo = get('SELECT * FROM sports WHERE id=?', sportId)
+  if (!spo) throw new Error('比赛项目不存在')
+  if (spo.format !== 'track') throw new Error(`「${spo.name}」不是田径计时项目，不能按田径成绩结算`)
+  if (!Array.isArray(body) || body.length === 0) throw new Error('成绩列表不能为空')
+
+  // 应录运动员 = 该项目已通过资格审核的运动员（与报名审核/退报撤销同一口径）
+  const expected = all(`SELECT id, name FROM athletes WHERE sport_id=? AND status='approved' ORDER BY id`, sportId)
+  if (!expected.length) throw new Error('该项目暂无已通过资格审核的运动员，无法结算')
+  const expectedById = new Map(expected.map(a => [a.id, a]))
+
+  // 逐条校验：运动员有效且不重复；成绩非空、为大于 0 的有限数值
+  const seen = new Set()
+  const rows = body.map((b, i) => {
+    const athleteId = Number(b?.athlete_id)
+    if (!Number.isInteger(athleteId)) throw new Error(`第 ${i + 1} 条成绩缺少有效的运动员`)
+    const name = expectedById.get(athleteId)?.name || `#${athleteId}`
+    if (seen.has(athleteId)) throw new Error(`运动员「${name}」的成绩重复录入`)
+    seen.add(athleteId)
+    const raw = b?.mark
+    const mark = (typeof raw === 'number' || typeof raw === 'string') && raw !== '' ? Number(raw) : NaN
+    if (!Number.isFinite(mark) || mark <= 0) throw new Error(`运动员「${name}」的成绩为空或无效（须为大于 0 的秒数）`)
+    return { athlete_id: athleteId, mark }
+  })
+
+  // 缺失 / 多余运动员：提交集合必须与应录集合完全一致，否则整体拒绝结算
+  const missing = expected.filter(a => !seen.has(a.id))
+  if (missing.length) throw new Error(`缺少 ${missing.length} 名运动员的成绩：${missing.map(a => a.name).join('、')}，请补录后再结算`)
+  const unknown = rows.filter(r => !expectedById.has(r.athlete_id))
+  if (unknown.length) throw new Error(`包含 ${unknown.length} 名未通过资格审核或不属于本项目的运动员（#${unknown.map(r => r.athlete_id).join('、#')}），已拒绝结算`)
+
+  // 排名只认成绩（升序），不信任客户端提交顺序；全部校验通过后事务落库，避免半截数据进入结算
+  rows.sort((a, b) => a.mark - b.mark || a.athlete_id - b.athlete_id)
+  db.exec('BEGIN')
+  try {
+    rows.forEach((r, i) => {
+      const res = run('UPDATE entries SET mark=?, rank=? WHERE athlete_id=? AND sport_id=?', r.mark, i + 1, r.athlete_id, sportId)
+      if (!res.changes) {
+        // 成绩档案缺失（如审核通过时未建档）：补建，保证结算覆盖全部参赛运动员
+        const uid = get('SELECT unit_id FROM athletes WHERE id=?', r.athlete_id)?.unit_id ?? null
+        run('INSERT INTO entries (sport_id,athlete_id,mark,rank,unit_id) VALUES (?,?,?,?,?)', sportId, r.athlete_id, r.mark, i + 1, uid)
+      }
+    })
+    run('UPDATE sports SET finished=1 WHERE id=?', sportId)
+    db.exec('COMMIT')
+  } catch (e) {
+    db.exec('ROLLBACK')
+    throw e
+  }
 
   recomputeMedals()
+  return { ok: true, count: rows.length }
 }
 /* ================= 参赛资格审核（报名 → 审核 → 退报/撤销） ================= */
 function submitRegistration(kind, unitId, sportId, name) {
@@ -971,6 +1020,11 @@ function approveRegistration(regId, reviewer) {
     }
   } else {
     run(`UPDATE athletes SET status='approved' WHERE id=?`, reg.athlete_id)
+    // 田径项目：通过审核即建立成绩档案（成绩待录入），保证成绩录入与结算覆盖全部参赛运动员
+    const spo = get('SELECT format FROM sports WHERE id=?', reg.sport_id)
+    if (spo?.format === 'track' && !get('SELECT id FROM entries WHERE sport_id=? AND athlete_id=?', reg.sport_id, reg.athlete_id)) {
+      run('INSERT INTO entries (sport_id,athlete_id,mark,rank,unit_id) VALUES (?,?,NULL,NULL,?)', reg.sport_id, reg.athlete_id, reg.unit_id)
+    }
   }
   rebuildStandings(reg.sport_id)
   recomputeMedals()
@@ -1079,8 +1133,9 @@ function withdrawOrRevoke(regId, action, note, reviewer) {
 }
 
 function recomputeTrackRanks(sportId) {
-  const rows = all(`SELECT id FROM entries WHERE sport_id=? ORDER BY mark ASC`, sportId)
-  rows.forEach((r, i) => run(`UPDATE entries SET rank=? WHERE id=?`, i + 1, r.id))
+  // 空成绩（待录入）不参与排名，排在最后且不给名次
+  const rows = all(`SELECT id, mark FROM entries WHERE sport_id=? ORDER BY mark IS NULL, mark ASC, id`, sportId)
+  rows.forEach((r, i) => run(`UPDATE entries SET rank=? WHERE id=?`, r.mark == null ? null : i + 1, r.id))
 }
 seed()
 
@@ -1378,8 +1433,8 @@ app.post('/api/ko/:sportId', (req, res) => {
   res.json({ ok: !!msg, msg })
 })
 app.post('/api/track/:sportId', (req, res) => {
-  finishTrack(Number(req.params.sportId), req.body)
-  res.json({ ok: true })
+  try { res.json(finishTrack(Number(req.params.sportId), req.body)) }
+  catch (e) { res.status(400).json({ error: e.message }) }
 })
 app.get('/api/reset', (_, res) => {
   ['assignment_logs', 'assignments', 'registrations', 'entries', 'standings', 'medals', 'matches', 'referees', 'venues', 'athletes', 'teams', 'units', 'sports'].forEach(t => { try { run(`DELETE FROM ${t}`) } catch (e) {} })

@@ -152,6 +152,8 @@ try { db.prepare(`ALTER TABLE matches ADD COLUMN note TEXT`).run() } catch (e) {
 })
 // 回填历史已完赛场次的胜方；小组/循环平局 winner 保持 NULL
 db.prepare(`UPDATE matches SET winner = CASE WHEN score_a > score_b THEN team_a WHEN score_b > score_a THEN team_b ELSE NULL END WHERE status='finished' AND winner IS NULL`).run()
+// 同一项目同一名运动员只允许一条成绩档案（历史数据存在重复时跳过，由结算校验兜底）
+try { db.prepare(`CREATE UNIQUE INDEX IF NOT EXISTS idx_entries_athlete ON entries(sport_id, athlete_id)`).run() } catch (e) { /* 存在历史重复数据 */ }
 
 export function run(sql, ...p) { return db.prepare(sql).run(...p) }
 export function all(sql, ...p) { return db.prepare(sql).all(...p) }

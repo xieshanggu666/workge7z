@@ -40,14 +40,22 @@ async function saveScore() {
 }
 
 const tr = reactive({})
-const getMark = e => tr[e.athlete_id] ?? e.mark
-const setMark = (e, ev) => { tr[e.athlete_id] = Number(ev.target.value) }
+// 区分「未修改」（沿用原成绩）与「已清空」（null，提交后由服务端校验拦截）
+const getMark = e => (e.athlete_id in tr ? tr[e.athlete_id] : e.mark)
+const setMark = (e, ev) => { tr[e.athlete_id] = ev.target.value === '' ? null : Number(ev.target.value) }
 async function saveTrack(sid) {
   const list = store.entries.filter(e => e.sport_id === sid)
-  const sorted = list.map(e => ({ athlete_id: e.athlete_id, mark: Number(tr[e.athlete_id] ?? e.mark) })).sort((a, b) => a.mark - b.mark)
-  await store.saveTrack(sid, sorted)
-  toast.value = '✅ 田径成绩已按时间排序并结算金/银/铜'
-  setTimeout(() => toast.value = '', 2600)
+  const payload = list.map(e => {
+    const v = e.athlete_id in tr ? tr[e.athlete_id] : e.mark
+    return { athlete_id: e.athlete_id, mark: v == null || v === '' ? null : Number(v) }
+  })
+  try {
+    await store.saveTrack(sid, payload)
+    toast.value = '✅ 田径成绩已按时间排序并结算金/银/铜'
+  } catch (e2) {
+    toast.value = '⚠️ ' + e2.message
+  }
+  setTimeout(() => toast.value = '', 3000)
 }
 const rankCls = r => r === 1 ? '#d99a00' : r === 2 ? '#90a4ae' : r === 3 ? '#c9743a' : 'var(--muted)'
 </script>
@@ -117,7 +125,7 @@ const rankCls = r => r === 1 ? '#d99a00' : r === 2 ? '#90a4ae' : r === 3 ? '#c97
         <table>
           <thead><tr><th>#</th><th>运动员</th><th>单位</th><th>成绩(秒)</th></tr></thead>
           <tbody>
-            <tr v-for="(e, i) in store.entries.filter(x=>x.sport_id===s.id).sort((a,b)=>a.mark-b.mark)" :key="e.id">
+            <tr v-for="(e, i) in store.entries.filter(x=>x.sport_id===s.id).sort((a,b)=>(a.mark??Infinity)-(b.mark??Infinity))" :key="e.id">
               <td><b :style="{ color: rankCls(e.rank), fontSize:'16px' }">{{ e.rank }}</b></td>
               <td>{{ e.aname }}</td>
               <td><span class="badge"><span class="dot" :style="{ background: store.unitOfUid(e.unit_id)?.color }"></span>{{ e.unit }}</span></td>
